@@ -81,59 +81,58 @@ func (h *uploadQueue) Close() error {
 }
 
 func (h *uploadQueue) Read(b []byte) (int, error) {
-	for {
-		if h.reader != nil {
-			return h.reader.Read(b)
-		}
-		if h.closed {
+	if h.reader != nil {
+		return h.reader.Read(b)
+	}
+	if h.closed {
+		return 0, io.EOF
+	}
+	if len(h.heap) == 0 {
+		packet, more := <-h.pushedPackets
+		if !more {
 			return 0, io.EOF
 		}
-		if len(h.heap) == 0 {
-			packet, more := <-h.pushedPackets
+		if packet.Reader != nil {
+			h.reader = packet.Reader
+			return h.reader.Read(b)
+		}
+		heap.Push(&h.heap, packet)
+	}
+	for len(h.heap) > 0 {
+		packet := heap.Pop(&h.heap).(Packet)
+		n := 0
+
+		if packet.Seq == h.nextSeq {
+			copy(b, packet.Payload)
+			n = min(len(b), len(packet.Payload))
+
+			if n < len(packet.Payload) {
+				// partial read
+				packet.Payload = packet.Payload[n:]
+				heap.Push(&h.heap, packet)
+			} else {
+				h.nextSeq = packet.Seq + 1
+			}
+
+			return n, nil
+		}
+		// misordered packet
+		if packet.Seq > h.nextSeq {
+			if len(h.heap) > h.maxPackets {
+				// the "reassembly buffer" is too large, and we want to
+				// constrain memory usage somehow. let's tear down the
+				// connection, and hope the application retries.
+				return 0, E.New("packet queue is too large")
+			}
+			heap.Push(&h.heap, packet)
+			packet2, more := <-h.pushedPackets
 			if !more {
 				return 0, io.EOF
 			}
-			if packet.Reader != nil {
-				h.reader = packet.Reader
-				return h.reader.Read(b)
-			}
-			heap.Push(&h.heap, packet)
-		}
-		for len(h.heap) > 0 {
-			packet := heap.Pop(&h.heap).(Packet)
-			n := 0
-
-			if packet.Seq == h.nextSeq {
-				copy(b, packet.Payload)
-				n = min(len(b), len(packet.Payload))
-
-				if n < len(packet.Payload) {
-					// partial read
-					packet.Payload = packet.Payload[n:]
-					heap.Push(&h.heap, packet)
-				} else {
-					h.nextSeq = packet.Seq + 1
-				}
-
-				return n, nil
-			}
-			// misordered packet
-			if packet.Seq > h.nextSeq {
-				if len(h.heap) > h.maxPackets {
-					// the "reassembly buffer" is too large, and we want to
-					// constrain memory usage somehow. let's tear down the
-					// connection, and hope the application retries.
-					return 0, E.New("packet queue is too large")
-				}
-				heap.Push(&h.heap, packet)
-				packet2, more := <-h.pushedPackets
-				if !more {
-					return 0, io.EOF
-				}
-				heap.Push(&h.heap, packet2)
-			}
+			heap.Push(&h.heap, packet2)
 		}
 	}
+	return 0, nil
 }
 
 // heap code directly taken from https://pkg.go.dev/container/heap
