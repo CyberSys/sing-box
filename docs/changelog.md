@@ -13,7 +13,6 @@ because system extensions require signatures to function, we have had to tempora
 __We plan to fix the App Store release issue and launch a new standalone desktop client, but until then,
 only clients on TestFlight will be available (unless you have an Apple Developer Program and compile from source code).__
 
->>>>>>> neworgin/main-next
 #### 1.12.12
 
 * Fixes and improvements
