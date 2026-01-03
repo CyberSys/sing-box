@@ -3,7 +3,9 @@ package xhttp
 import (
 	"context"
 	gotls "crypto/tls"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
@@ -17,11 +19,13 @@ import (
 	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/tls"
+	"github.com/sagernet/sing-box/common/vision"
 	"github.com/sagernet/sing-box/common/xray/buf"
-	"github.com/sagernet/sing-box/common/xray/net"
+	xrnet "github.com/sagernet/sing-box/common/xray/net"
 	"github.com/sagernet/sing-box/common/xray/pipe"
 	"github.com/sagernet/sing-box/common/xray/signal/done"
 	"github.com/sagernet/sing-box/common/xray/uuid"
+	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	qtls "github.com/sagernet/sing-quic"
 	"github.com/sagernet/sing/common"
@@ -37,6 +41,9 @@ import (
 type Client struct {
 	ctx            context.Context
 	options        *option.V2RayXHTTPOptions
+	dest           M.Socksaddr
+	downloadDest   *M.Socksaddr
+	logger         log.ContextLogger
 	getRequestURL  func(sessionId string) url.URL
 	getRequestURL2 func(sessionId string) url.URL
 	getHTTPClient  func() (DialerClient, *XmuxClient)
@@ -59,7 +66,7 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 	}
 	mode := configMode
 	dest := serverAddr
-	_, isReality := tlsConfig.(*tls.RealityClientConfig)
+	isReality := isRealityConfig(tlsConfig)
 	if mode == "auto" {
 		mode = "packet-up"
 		if isReality {
@@ -97,6 +104,11 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 	}
 	getRequestURL2 := getRequestURL
 	getHTTPClient2 := getHTTPClient
+	var downloadDest *M.Socksaddr
+	var clientLogger log.ContextLogger
+	if l := service.FromContext[log.ContextLogger](ctx); l != nil {
+		clientLogger = l
+	}
 	if options.Download != nil {
 		options2 := options.Download
 		dialer2 := dialer
@@ -108,6 +120,7 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 			}
 		}
 		dest2 := options2.ServerOptions.Build()
+		downloadDest = &dest2
 		var tlsConfig2 tls.Config
 		if options2.TLS != nil {
 			tlsConfig2, err = tls.NewClient(ctx, options2.Server, common.PtrValueOrDefault(options2.TLS))
@@ -142,6 +155,9 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 	return &Client{
 		ctx:            ctx,
 		options:        &options,
+		dest:           dest,
+		downloadDest:   downloadDest,
+		logger:         clientLogger,
 		getHTTPClient:  getHTTPClient,
 		getHTTPClient2: getHTTPClient2,
 		getRequestURL:  getRequestURL,
@@ -156,7 +172,23 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 	requestURL := c.getRequestURL(sessionIdUuid.String())
 	requestURL2 := c.getRequestURL2(sessionIdUuid.String())
 	httpClient, xmuxClient := c.getHTTPClient()
-	httpClient2, xmuxClient2 := c.getHTTPClient2()
+	var httpClient2 DialerClient
+	var xmuxClient2 *XmuxClient
+	if mode != "stream-one" || c.downloadDest != nil {
+		httpClient2, xmuxClient2 = c.getHTTPClient2()
+	}
+	httpVersion := httpVersionFromClient(httpClient)
+	destLabel := formatDestWithNetwork(httpClient, c.dest)
+	logger := c.logger
+	if logger == nil {
+		logger = log.StdLogger()
+	}
+	logger.DebugContext(ctx, fmt.Sprintf("XHTTP is dialing to %s, mode %s, HTTP version %s, host %s", destLabel, mode, httpVersion, requestURL.Host))
+	if c.downloadDest != nil {
+		httpVersion2 := httpVersionFromClient(httpClient2)
+		destLabel2 := formatDestWithNetwork(httpClient2, *c.downloadDest)
+		logger.DebugContext(ctx, fmt.Sprintf("XHTTP is downloading from %s, mode %s, HTTP version %s, host %s", destLabel2, "stream-down", httpVersion2, requestURL2.Host))
+	}
 	if xmuxClient != nil {
 		xmuxClient.OpenUsage.Add(1)
 	}
@@ -299,7 +331,7 @@ func (c *Client) Close() error {
 }
 
 func decideHTTPVersion(tlsConfig tls.Config) string {
-	if _, ok := tlsConfig.(*tls.RealityClientConfig); ok {
+	if isRealityConfig(tlsConfig) {
 		return "2"
 	}
 	if tlsConfig == nil {
@@ -346,18 +378,47 @@ func getBaseRequestURL(options *option.V2RayXHTTPBaseOptions, dest M.Socksaddr, 
 	return requestURL, nil
 }
 
+func isRealityConfig(tlsConfig tls.Config) bool {
+	if tlsConfig == nil {
+		return false
+	}
+	return strings.Contains(fmt.Sprintf("%T", tlsConfig), ".RealityClientConfig")
+}
+
+func httpVersionFromClient(client DialerClient) string {
+	if client == nil {
+		return "unknown"
+	}
+	if defaultClient, ok := client.(*DefaultDialerClient); ok {
+		return defaultClient.httpVersion
+	}
+	return "unknown"
+}
+
+func formatDestWithNetwork(client DialerClient, dest M.Socksaddr) string {
+	network := "tcp"
+	if defaultClient, ok := client.(*DefaultDialerClient); ok && defaultClient.httpVersion == "3" {
+		network = "udp"
+	}
+	return network + ":" + dest.String()
+}
+
 func createHTTPClient(dest M.Socksaddr, dialer N.Dialer, options *option.V2RayXHTTPBaseOptions, tlsConfig tls.Config) DialerClient {
 	httpVersion := decideHTTPVersion(tlsConfig)
 	dialContext := func(ctxInner context.Context) (net.Conn, error) {
-		conn, err := dialer.DialContext(ctxInner, "tcp", dest)
+		conn, err := dialer.DialContext(ctxInner, N.NetworkTCP, dest)
 		if err != nil {
 			return nil, err
 		}
+		hook, hasHook := vision.HookFromContext(ctxInner)
 		needTLS := tlsConfig != nil && httpVersion != "3"
 		if needTLS {
 			conn, err = tls.ClientHandshake(ctxInner, conn, tlsConfig)
 			if err != nil {
 				return nil, err
+			}
+			if hasHook {
+				hook(conn)
 			}
 		}
 		return conn, nil
@@ -370,13 +431,13 @@ func createHTTPClient(dest M.Socksaddr, dialer N.Dialer, options *option.V2RayXH
 	switch httpVersion {
 	case "3":
 		if keepAlivePeriod == 0 {
-			keepAlivePeriod = net.QuicgoH3KeepAlivePeriod
+			keepAlivePeriod = xrnet.QuicgoH3KeepAlivePeriod
 		}
 		if keepAlivePeriod < 0 {
 			keepAlivePeriod = 0
 		}
 		quicConfig := &quic.Config{
-			MaxIdleTimeout: net.ConnIdleTimeout,
+			MaxIdleTimeout: xrnet.ConnIdleTimeout,
 			// these two are defaults of quic-go/http3. the default of quic-go (no
 			// http3) is different, so it is hardcoded here for clarity.
 			// https://github.com/quic-go/quic-go/blob/b8ea5c798155950fb5bbfdd06cad1939c9355878/http3/client.go#L36-L39
@@ -395,7 +456,7 @@ func createHTTPClient(dest M.Socksaddr, dialer N.Dialer, options *option.V2RayXH
 		}
 	case "2":
 		if keepAlivePeriod == 0 {
-			keepAlivePeriod = net.ChromeH2KeepAlivePeriod
+			keepAlivePeriod = xrnet.ChromeH2KeepAlivePeriod
 		}
 		if keepAlivePeriod < 0 {
 			keepAlivePeriod = 0
@@ -404,7 +465,7 @@ func createHTTPClient(dest M.Socksaddr, dialer N.Dialer, options *option.V2RayXH
 			DialTLSContext: func(ctxInner context.Context, network string, addr string, cfg *gotls.Config) (net.Conn, error) {
 				return dialContext(ctxInner)
 			},
-			IdleConnTimeout: net.ConnIdleTimeout,
+			IdleConnTimeout: xrnet.ConnIdleTimeout,
 			ReadIdleTimeout: keepAlivePeriod,
 		}
 	default:
@@ -414,7 +475,7 @@ func createHTTPClient(dest M.Socksaddr, dialer N.Dialer, options *option.V2RayXH
 		transport = &http.Transport{
 			DialTLSContext:  httpDialContext,
 			DialContext:     httpDialContext,
-			IdleConnTimeout: net.ConnIdleTimeout,
+			IdleConnTimeout: xrnet.ConnIdleTimeout,
 			// chunked transfer download with KeepAlives is buggy with
 			// http.Client and our custom dial context.
 			DisableKeepAlives: true,
