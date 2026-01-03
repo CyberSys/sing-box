@@ -1,8 +1,6 @@
 package v2raykcp
 
-import (
-	"sync"
-)
+import "sync"
 
 type ReceivingWindow struct {
 	cache map[uint32]*DataSegment
@@ -206,8 +204,10 @@ func (w *ReceivingWorker) Read(b []byte) int {
 	if mb.IsEmpty() {
 		return 0
 	}
-	nBytes := Copy(mb, b)
-	ReleaseMulti(mb)
+	mb, nBytes := SplitBytes(mb, b)
+	if !mb.IsEmpty() {
+		w.leftOver = mb
+	}
 	return nBytes
 }
 
