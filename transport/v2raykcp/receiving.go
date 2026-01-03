@@ -2,8 +2,6 @@ package v2raykcp
 
 import (
 	"sync"
-
-	"github.com/sagernet/sing/common/buf"
 )
 
 type ReceivingWindow struct {
@@ -131,7 +129,7 @@ func (l *AckList) Flush(current uint32, rto uint32) {
 type ReceivingWorker struct {
 	sync.RWMutex
 	conn       *Connection
-	leftOver   buf.MultiBuffer
+	leftOver   MultiBuffer
 	window     *ReceivingWindow
 	acklist    *AckList
 	nextNumber uint32
@@ -150,7 +148,7 @@ func NewReceivingWorker(kcp *Connection) *ReceivingWorker {
 
 func (w *ReceivingWorker) Release() {
 	w.Lock()
-	buf.ReleaseMulti(w.leftOver)
+	ReleaseMulti(w.leftOver)
 	w.leftOver = nil
 	w.Unlock()
 }
@@ -179,14 +177,14 @@ func (w *ReceivingWorker) ProcessSegment(seg *DataSegment) {
 	}
 }
 
-func (w *ReceivingWorker) ReadMultiBuffer() buf.MultiBuffer {
+func (w *ReceivingWorker) ReadMultiBuffer() MultiBuffer {
 	if w.leftOver != nil {
 		mb := w.leftOver
 		w.leftOver = nil
 		return mb
 	}
 
-	mb := make(buf.MultiBuffer, 0, 32)
+	mb := make(MultiBuffer, 0, 32)
 
 	w.Lock()
 	defer w.Unlock()
@@ -208,8 +206,8 @@ func (w *ReceivingWorker) Read(b []byte) int {
 	if mb.IsEmpty() {
 		return 0
 	}
-	nBytes := buf.Copy(mb, b)
-	buf.ReleaseMulti(mb)
+	nBytes := Copy(mb, b)
+	ReleaseMulti(mb)
 	return nBytes
 }
 
