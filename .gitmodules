@@ -1,3 +1,8 @@
 [submodule "clients/apple"]
 	path = clients/apple
 	url = https://github.com/SagerNet/sing-box-for-apple.git
+	branch = main
+[submodule "clients/android"]
+	path = clients/android
+	url = https://github.com/SagerNet/sing-box-for-android.git
+	branch = main
